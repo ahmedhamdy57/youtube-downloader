@@ -9,12 +9,13 @@ import sys
 import queue
 import threading
 import subprocess
+from datetime import datetime
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 import yt_dlp
-from yt_dlp.utils import DownloadCancelled
+from yt_dlp.utils import DownloadCancelled, sanitize_filename
 
 APP_NAME = "YouTube Downloader"
 DEFAULT_FOLDER = str(Path.home() / "Downloads" / "YouTube Videos")
@@ -67,6 +68,86 @@ def friendly_hint(msg):
     return ""
 
 
+# ---------------- notes file (description, chapters, details) ----------------
+LINE = "=" * 64
+
+
+def fmt_time(sec):
+    if sec is None:
+        return ""
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_date(yyyymmdd):
+    try:
+        return datetime.strptime(yyyymmdd, "%Y%m%d").strftime("%b %d, %Y").replace(" 0", " ")
+    except Exception:
+        return ""
+
+
+def fmt_num(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return ""
+
+
+def keep_info(info):
+    keys = ["id", "title", "uploader", "channel", "upload_date", "view_count", "like_count",
+            "duration", "webpage_url", "description", "chapters", "playlist_title", "playlist_index"]
+    return {k: info.get(k) for k in keys}
+
+
+def video_block(e, number=None):
+    title = e.get("title") or "Untitled"
+    lines = [LINE, f"{number}. {title}" if number else title, LINE]
+    rows = [("Channel", e.get("uploader") or e.get("channel")),
+            ("Date", fmt_date(e.get("upload_date") or "")),
+            ("Views", fmt_num(e.get("view_count"))),
+            ("Likes", fmt_num(e.get("like_count"))),
+            ("Length", fmt_time(e.get("duration"))),
+            ("Link", e.get("webpage_url"))]
+    for k, v in rows:
+        if v:
+            lines.append(f"{k + ':':<9}{v}")
+    chapters = e.get("chapters") or []
+    if chapters:
+        lines += ["", "CHAPTERS", "--------"]
+        lines += [f"  {fmt_time(c.get('start_time')):>8}   {c.get('title', '')}" for c in chapters]
+    desc = (e.get("description") or "").strip()
+    lines += ["", "DESCRIPTION", "-----------", desc or "(no description)", "", ""]
+    return "\n".join(lines)
+
+
+def write_notes(entries, folder, playlist):
+    """One notes file per video, or ONE file for a whole playlist. Returns the file path."""
+    if not entries:
+        return None
+    entries = sorted(entries, key=lambda e: e.get("playlist_index") or 0)
+    if playlist:
+        name = sanitize_filename(entries[0].get("playlist_title") or "Playlist")
+        out_dir = os.path.join(folder, name)
+        path = os.path.join(out_dir, f"{name} - notes.txt")
+        text = [LINE, f"PLAYLIST: {entries[0].get('playlist_title') or name}",
+                f"Videos saved: {len(entries)}", LINE, "", "CONTENTS", "--------"]
+        text += [f"{i:>3}. {e.get('title') or 'Untitled'}" for i, e in enumerate(entries, 1)]
+        text += ["", ""]
+        text += [video_block(e, e.get("playlist_index") or i) for i, e in enumerate(entries, 1)]
+    else:
+        e = entries[0]
+        name = sanitize_filename(e.get("title") or "video")
+        out_dir = folder
+        path = os.path.join(out_dir, f"{name} - notes.txt")
+        text = [video_block(e)]
+    os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(text))
+    return path
+
+
 class QLogger:
     def __init__(self, q):
         self.q = q
@@ -92,8 +173,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME}  (yt-dlp {yt_dlp.version.__version__})")
-        self.geometry("720x640")
-        self.minsize(620, 560)
+        self.geometry("720x760")
+        self.minsize(620, 680)
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.running = False
@@ -106,6 +187,13 @@ class App(tk.Tk):
         self.folder = tk.StringVar(value=DEFAULT_FOLDER)
         self.items = tk.StringVar()
         self.ignore = tk.BooleanVar(value=True)
+        self.subs = tk.BooleanVar(value=False)
+        self.sub_langs = tk.StringVar(value="en")
+        self.sub_embed = tk.BooleanVar(value=False)
+        self.desc = tk.BooleanVar(value=False)
+        self.notes = {}
+        self.notes_dir = DEFAULT_FOLDER
+        self.notes_playlist = False
 
         self.build_ui()
         self.after(100, self.poll)
@@ -155,6 +243,15 @@ class App(tk.Tk):
         ttk.Label(adv, text="Example: 1-5. Leave empty for all.").grid(row=2, column=2, sticky="w")
         ttk.Checkbutton(adv, text="Skip videos that are not available and keep going",
                         variable=self.ignore).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(adv, text="Download subtitles", variable=self.subs).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(adv, text="Subtitle languages").grid(row=5, column=0, sticky="w", pady=3)
+        ttk.Entry(adv, textvariable=self.sub_langs, width=14).grid(row=5, column=1, sticky="w", padx=6)
+        ttk.Label(adv, text="Example: en   or   en,ar   (keep the list short)").grid(row=5, column=2, sticky="w")
+        ttk.Checkbutton(adv, text="Put the subtitles inside the video file (video only)",
+                        variable=self.sub_embed).grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(adv, text="Save a notes file (description, chapters, views, links)",
+                        variable=self.desc).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         bar = ttk.Frame(f)
         bar.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 4))
@@ -223,6 +320,9 @@ class App(tk.Tk):
                 self.q.put(("progress", (pct, f"{label}{pct:.0f}%   {speed}   time left {eta}")))
             elif d["status"] == "finished":
                 self.q.put(("line", "Downloaded: " + os.path.basename(d.get("filename", ""))))
+                info = d.get("info_dict") or {}
+                if self.desc.get() and info.get("id"):
+                    self.notes[info["id"]] = keep_info(info)
 
         opts = {
             "outtmpl": os.path.join(folder, tmpl),
@@ -250,6 +350,16 @@ class App(tk.Tk):
             opts["playlist_items"] = self.items.get().strip()
         if self.browser.get() != "None":
             opts["cookiesfrombrowser"] = (self.browser.get(),)
+
+        if self.subs.get():
+            langs = [x.strip() for x in self.sub_langs.get().split(",") if x.strip()] or ["en"]
+            opts["writesubtitles"] = True        # real subtitles made by the uploader
+            opts["writeautomaticsub"] = True     # auto-generated ones if there are no real ones
+            opts["subtitleslangs"] = langs
+            opts.setdefault("postprocessors", [])
+            opts["postprocessors"].append({"key": "FFmpegSubtitlesConvertor", "format": "srt"})
+            if self.sub_embed.get() and self.kind.get() == "video":
+                opts["postprocessors"].append({"key": "FFmpegEmbedSubtitle"})
         return opts
 
     def start(self):
@@ -264,6 +374,9 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Cannot use that folder:\n{e}")
             return
         self.cancel.clear()
+        self.notes = {}
+        self.notes_dir = folder
+        self.notes_playlist = self.scope.get() == "playlist"
         self.pbar["value"] = 0
         self.status.configure(text="Starting...")
         self.write("Starting download...")
@@ -271,14 +384,27 @@ class App(tk.Tk):
         opts = self.make_options(folder)
         threading.Thread(target=self.worker, args=(opts, url), daemon=True).start()
 
+    def save_notes(self):
+        if not self.desc.get() or not self.notes:
+            return
+        try:
+            path = write_notes(list(self.notes.values()), self.notes_dir, self.notes_playlist)
+            if path:
+                self.q.put(("line", "Notes saved: " + path))
+        except Exception as e:  # noqa
+            self.q.put(("line", "Could not save the notes file: " + str(e)))
+
     def worker(self, opts, url):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 code = ydl.download([url])
+            self.save_notes()
             self.q.put(("done", code))
         except DownloadCancelled:
+            self.save_notes()
             self.q.put(("cancelled", None))
         except Exception as e:  # noqa
+            self.save_notes()
             msg = str(e)
             self.q.put(("line", "Error: " + msg))
             hint = friendly_hint(msg)
