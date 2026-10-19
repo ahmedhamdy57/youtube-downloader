@@ -1,0 +1,89 @@
+name: Build apps
+
+on:
+  push:
+    tags: ["v*"]        # pushing a tag like v1.0.0 builds and publishes a Release
+  workflow_dispatch:     # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            deno: deno-x86_64-pc-windows-msvc.zip
+            exe: deno.exe
+            sep: ";"
+            icon: assets/icon.ico
+          - os: ubuntu-22.04
+            deno: deno-x86_64-unknown-linux-gnu.zip
+            exe: deno
+            sep: ":"
+            icon: assets/icon.png
+          - os: macos-latest
+            deno: deno-aarch64-apple-darwin.zip
+            exe: deno
+            sep: ":"
+            icon: assets/icon.png
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux: install Tk
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install Python packages
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt pyinstaller pillow
+
+      - name: Download Deno (needed by YouTube)
+        shell: bash
+        run: |
+          mkdir deno_bin
+          curl -fsSL -o deno.zip "https://github.com/denoland/deno/releases/latest/download/${{ matrix.deno }}"
+          unzip -o deno.zip -d deno_bin
+          chmod +x "deno_bin/${{ matrix.exe }}" || true
+
+      - name: Build the app
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --windowed \
+            --name "YouTube Downloader" \
+            --icon "${{ matrix.icon }}" \
+            --collect-all imageio_ffmpeg \
+            --collect-all yt_dlp_ejs \
+            --collect-submodules yt_dlp \
+            --add-binary "deno_bin/${{ matrix.exe }}${{ matrix.sep }}." \
+            app/yt_downloader.py
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          case "${{ runner.os }}" in
+            Windows) 7z a "../YouTube-Downloader-Windows.zip" "YouTube Downloader" ;;
+            macOS)   rm -rf "YouTube Downloader"
+                     ditto -c -k --keepParent "YouTube Downloader.app" "../YouTube-Downloader-Mac.zip" ;;
+            Linux)   tar -czf "../YouTube-Downloader-Linux.tar.gz" "YouTube Downloader" ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-Downloader-${{ runner.os }}
+          path: YouTube-Downloader-*
+
+      - name: Publish to Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: YouTube-Downloader-*
